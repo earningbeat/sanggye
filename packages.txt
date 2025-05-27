@@ -1,2 +1,4 @@
 poppler-utils
-tesseract-ocr 
+tesseract-ocr
+build-essential
+python3-dev 

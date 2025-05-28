@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Python
 __pycache__/
 *.py[cod]
@@ -21,4 +22,29 @@ Release-*/
 
 # OS
 .DS_Store
+=======
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv*/
+.env
+
+# Project specific
+*.xlsx
+*.xls
+*.pdf
+backup/
+demo/
+Release-*/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+>>>>>>> 55ef71880d52a75d2d8f039bd7da6241528941f4
 Thumbs.db 

@@ -34,7 +34,11 @@ def enhance_image(pil_img):
     
     return Image.fromarray(binary)
 
+<<<<<<< HEAD
+def clova_ocr(img_path, max_retries=3, retry_delay=2):
+=======
 def clova_ocr(img_path):
+>>>>>>> 55ef71880d52a75d2d8f039bd7da6241528941f4
     """네이버 클로바 OCR을 사용하여 이미지에서 텍스트를 추출합니다."""
     headers = {"X-OCR-SECRET": CLOVA_SECRET}
     payload = {
@@ -53,9 +57,53 @@ def clova_ocr(img_path):
         "file": ("page.png", img_bytes, "application/octet-stream"),
     }
 
+<<<<<<< HEAD
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            # 세션을 사용하여 연결 재사용
+            session = requests.Session()
+            session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+            
+            res = session.post(
+                CLOVA_URL, 
+                headers=headers, 
+                files=files, 
+                timeout=120,  # 타임아웃 증가
+                verify=True   # SSL 검증 활성화
+            )
+            res.raise_for_status()
+            return res.json()["images"][0].get("fields", [])
+            
+        except (requests.exceptions.SSLError, 
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_error = e
+            print(f"OCR API 호출 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))  # 지수 백오프
+                continue
+            else:
+                raise e
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            print(f"OCR API 요청 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            else:
+                raise e
+        finally:
+            if 'session' in locals():
+                session.close()
+    
+    # 모든 재시도 실패 시
+    raise last_error if last_error else Exception("OCR API 호출 실패")
+=======
     res = requests.post(CLOVA_URL, headers=headers, files=files, timeout=60)
     res.raise_for_status()
     return res.json()["images"][0].get("fields", [])
+>>>>>>> 55ef71880d52a75d2d8f039bd7da6241528941f4
 
 def extract_departments_with_pages(ocr_text):
     """OCR 텍스트에서 부서명과 해당 페이지 번호를 추출합니다."""

@@ -82,13 +82,7 @@ S3_DIRS = {
     "PREVIEW_IMAGES": "preview_images/"  # 미리보기 이미지 디렉토리 추가
 }
 
-def get_s3_file_modified_time(s3_handler, key):
-    """S3 파일의 마지막 수정 시각을 반환 (datetime)"""
-    try:
-        response = s3_handler.s3_client.head_object(Bucket=s3_handler.bucket, Key=key)
-        return response['LastModified']
-    except Exception as e:
-        return None
+
     
 
 
@@ -124,12 +118,12 @@ class S3Handler:
             logger.error(f"S3 다운로드 실패 ({file_key}): {e}")
             return {"status": "error", "message": str(e)}
 
-    def get_s3_file_modified_time(s3_handler, key):
+    def get_s3_file_modified_time(self, key):
         """S3 파일의 마지막 수정 시각을 반환 (datetime)"""
         try:
-            response = s3_handler.s3_client.head_object(Bucket=s3_handler.bucket, Key=key)
+            response = self.s3_client.head_object(Bucket=self.bucket, Key=key)
             return response['LastModified']
-        except Exception as e:
+        except Exception:
             return None
 
     def save_metadata(self, date_str, metadata):

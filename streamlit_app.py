@@ -90,28 +90,7 @@ def get_s3_file_modified_time(s3_handler, key):
     except Exception as e:
         return None
     
-def save_all_date_mismatches(s3_handler, mismatch_data):
-    """
-    전체 불일치 데이터 DataFrame(mismatch_data)에서
-    날짜별로 분리하여 S3에 /results/{날짜}/mismatches.json 저장.
-    """
-    if mismatch_data.empty:
-        logger.info("[자동화] 날짜별 불일치 데이터 저장: 데이터 없음")
-        return
-    
-    logger.info(f"[자동화] 전체 불일치 데이터 저장 시작: 총 {len(mismatch_data)}개 항목")
-    total_saved = 0
-    
-    for date in mismatch_data['날짜'].unique():
-        # 날짜 형식이 잘못된 폴더 생성을 방지!
-        # 날짜는 항상 'YYYY-MM-DD' 형태로 변환
-        safe_date = pd.to_datetime(date, errors='coerce').strftime('%Y-%m-%d')
-        date_df = mismatch_data[mismatch_data['날짜'] == date].copy()
-        s3_handler.save_mismatch_data(safe_date, date_df)
-        total_saved += len(date_df)
-        logger.info(f"[자동화] {safe_date} 불일치 데이터 {len(date_df)}행 저장 완료")
-    
-    logger.info(f"[자동화] 날짜별 불일치 데이터 저장 완료: 총 {total_saved}개 항목 저장됨")
+
 
 class S3Handler:
     def __init__(self):
@@ -447,6 +426,7 @@ class S3Handler:
 
     def save_missing_items_by_date(self, missing_df, date_str):
 
+
         try:
             mismatch_key = f"{self.dirs['RESULTS']}{date_str}/mismatches.json"
             try:
@@ -457,32 +437,83 @@ class S3Handler:
                 # 기존 파일이 없으면 빈 DF로 시작
                 mismatch_df = pd.DataFrame()
 
-            # 1. 컬럼 구조 맞추기
-            for col in missing_df.columns:
-                if col not in mismatch_df.columns:
-                    mismatch_df[col] = ""
-            for col in mismatch_df.columns:
+            # 1. 컬럼 구조 맞추기 - 표준 컬럼 순서 정의
+            standard_columns = ['날짜', '부서명', '물품코드', '물품명', '청구량', '수령량', '차이', '누락']
+            
+            # 기존 데이터가 없으면 표준 컬럼으로 초기화
+            if mismatch_df.empty:
+                mismatch_df = pd.DataFrame(columns=standard_columns)
+            
+            # missing_df에 누락된 컬럼 추가
+            for col in standard_columns:
                 if col not in missing_df.columns:
                     missing_df[col] = ""
-            missing_df = missing_df[mismatch_df.columns]
+                if col not in mismatch_df.columns:
+                    mismatch_df[col] = ""
+            
+            # 표준 컬럼 순서로 정렬
+            missing_df = missing_df[standard_columns]
+            mismatch_df = mismatch_df[standard_columns]
 
             # 2. 기존 + 신규(전산누락) append/concat
             combined = pd.concat([mismatch_df, missing_df], ignore_index=True)
 
-            # 3. (필요시) 중복제거 (ex: 날짜, 부서명, 물품코드)
-            combined = combined.drop_duplicates(subset=['날짜', '부서명', '물품코드'], keep='last')
+            # 3. 중복제거 시 누락 컬럼 보존 로직 추가
+            before_dedup = len(combined)
+            # 날짜, 부서명, 물품코드가 같은 항목들을 그룹화하여 누락 컬럼 병합
+            if not combined.empty:
+                # 중복 항목들을 찾아서 누락 컬럼 병합
+                duplicated_mask = combined.duplicated(subset=['날짜', '부서명', '물품코드'], keep=False)
+                if duplicated_mask.any():
+                    # 중복된 항목들 처리
+                    duplicated_items = combined[duplicated_mask].copy()
+                    non_duplicated_items = combined[~duplicated_mask].copy()
+                    
+                    # 중복 항목들을 그룹화하여 누락 컬럼 병합
+                    merged_duplicates = []
+                    for (date, dept, code), group in duplicated_items.groupby(['날짜', '부서명', '물품코드']):
+                        # 가장 최근 항목을 기본으로 사용
+                        merged_item = group.iloc[-1].copy()
+                        
+                        # 누락 컬럼 병합: null이 아닌 값 우선 사용
+                        missing_values = group['누락'].dropna()
+                        if not missing_values.empty:
+                            # 전산누락이 있으면 우선 사용, 없으면 다른 값 사용
+                            if '전산누락' in missing_values.values:
+                                merged_item['누락'] = '전산누락'
+                            else:
+                                merged_item['누락'] = missing_values.iloc[-1]
+                        
+                        merged_duplicates.append(merged_item)
+                    
+                    # 중복 제거된 항목들과 비중복 항목들 결합
+                    if merged_duplicates:
+                        combined = pd.concat([non_duplicated_items, pd.DataFrame(merged_duplicates)], ignore_index=True)
+                    else:
+                        combined = non_duplicated_items
+                else:
+                    # 중복이 없으면 그대로 사용
+                    pass
+            
+            after_dedup = len(combined)
+            logger.info(f"중복 제거 (누락 컬럼 보존): {before_dedup}개 → {after_dedup}개")
 
             # 4. 날짜별 파일 저장 (통합 작업은 부서별 통계 탭에서 수동 실행)
             mismatch_json = combined.to_json(orient="records", indent=4)
             self.s3_client.put_object(Bucket=self.bucket, Key=mismatch_key, Body=mismatch_json)
             logger.info(f"날짜별 mismatches.json({date_str}) 저장/업데이트 완료: {len(combined)}개")
             
-            # 5. 전체 통합 파일 즉시 업데이트 제거 (부서별 통계 탭에서 수동 병합)
-            # update_result = self.update_full_mismatches_json()  # 주석 처리
-            # if update_result["status"] == "success":
-            #     logger.info(f"전산누락 저장 후 전체 통합 파일 업데이트 완료: {update_result.get('count', 0)}개 항목")
-            # else:
-            #     logger.warning(f"전산누락 저장 후 전체 통합 파일 업데이트 실패: {update_result.get('message')}")
+            # 저장 직후 확인 (디버깅용)
+            try:
+                verify_result = self.s3_client.get_object(Bucket=self.bucket, Key=mismatch_key)
+                verify_data = json.loads(verify_result['Body'].read())
+                logger.info(f"저장 확인: {mismatch_key}에 {len(verify_data)}개 항목 존재")
+                # 전산누락 항목 확인
+                missing_count = sum(1 for item in verify_data if '누락' in item and '누락' in str(item.get('누락', '')))
+                logger.info(f"저장 확인: 전산누락 항목 {missing_count}개 포함")
+            except Exception as e:
+                logger.error(f"저장 확인 실패: {e}")
+
             
             return {"status": "success", "message": f"{date_str} 전산누락 데이터 저장 완료. 부서별 통계에서 '날짜별 작업 내용 병합' 버튼을 눌러주세요."}
 
@@ -522,99 +553,98 @@ class S3Handler:
         try:
             prefix = f"{self.dirs['RESULTS']}"
             date_folders = self.list_all_dates_in_results()
-            
+
             if not date_folders:
                 logger.warning("통합할 날짜별 mismatches.json 파일이 없습니다.")
                 return {"status": "error", "message": "날짜별 파일 없음"}
-            
+
             all_mismatches = []
             for date_str in date_folders:
                 key = f"{prefix}{date_str}/mismatches.json"
-                try:   
+                try:
                     s3_obj = self.s3_client.get_object(Bucket=self.bucket, Key=key)
                     json_bytes = s3_obj["Body"].read()
                     df = pd.read_json(io.BytesIO(json_bytes), orient="records")
-                    if not df.empty:
-                        logger.debug(f"{date_str} 파일 로드 후 날짜 샘플: {df['날짜'].head().tolist()}")
-                        
-                        # 날짜 형식 검증 및 수정
-                        try:
-                            # 먼저 현재 날짜 컬럼 상태 확인
-                            if '날짜' in df.columns:
-                                # 날짜가 숫자(timestamp)로 저장된 경우 처리
-                                if df['날짜'].dtype in ['int64', 'float64']:
-                                    logger.warning(f"{date_str}: 날짜가 숫자 형태로 저장됨. 파일명 기준으로 수정")
-                                    df['날짜'] = date_str
-                                else:
-                                    # 문자열이지만 잘못된 형식인 경우
-                                    df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
-                                    invalid_dates = df['날짜'].isna()
-                                    if invalid_dates.any():
-                                        logger.warning(f"{date_str}: {invalid_dates.sum()}개 잘못된 날짜 발견. 파일명 기준으로 수정")
-                                        df.loc[invalid_dates, '날짜'] = pd.to_datetime(date_str)
-                                    
-                                    # 최종 문자열 형식으로 변환
-                                    df['날짜'] = df['날짜'].dt.strftime('%Y-%m-%d')
-                                
-                                logger.debug(f"{date_str} 날짜 수정 후 샘플: {df['날짜'].head().tolist()}")
-                                all_mismatches.append(df)
-                            else:
-                                logger.warning(f"{date_str}: '날짜' 컬럼이 없음")
-                                continue
-                        except Exception as e:
-                            logger.warning(f"{date_str} 날짜 형식 처리 오류: {e}")
-                            # 오류 발생 시 파일명을 날짜로 사용
-                            df['날짜'] = date_str
-                            all_mismatches.append(df)
+
+                    # 날짜 컬럼 표준화
+                    if '날짜' in df.columns:
+                        df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+                        invalid_dates = df['날짜'].isna()
+                        if invalid_dates.any():
+                            logger.warning(f"{date_str}: 날짜 형식 오류 발견. 파일명 기준으로 수정")
+                            df.loc[invalid_dates, '날짜'] = date_str
+                    else:
+                        df['날짜'] = date_str
+
+                    if '누락' in df.columns:
+                        missing_items = df[df['누락'].str.contains('누락', na=False)]
+                        normal_items = df[~df['누락'].str.contains('누락', na=False)]
+
+                        # 전산누락 항목만 있는 경우
+                        if not missing_items.empty and normal_items.empty:
+                            logger.info(f"{date_str}: 전산누락 항목만 존재 ({len(missing_items)}개)")
+                            all_mismatches.append(missing_items)
+
+                        # 일반 불일치 항목만 있는 경우
+                        elif missing_items.empty and not normal_items.empty:
+                            logger.info(f"{date_str}: 일반 불일치 항목만 존재 ({len(normal_items)}개)")
+                            all_mismatches.append(normal_items)
+
+                        # 둘 다 있는 경우
+                        elif not missing_items.empty and not normal_items.empty:
+                            logger.info(f"{date_str}: 일반 불일치({len(normal_items)}개), 전산누락({len(missing_items)}개) 존재")
+                            combined_df = pd.concat([normal_items, missing_items], ignore_index=True)
+                            all_mismatches.append(combined_df)
+
+                        # 둘 다 없는 경우는 건너뜀
+                    else:
+                        # 누락 컬럼 자체가 없을 경우 전체 추가
+                        logger.info(f"{date_str}: '누락' 컬럼 없음, 전체 추가")
+                        all_mismatches.append(df)
+
                 except Exception as e:
                     logger.warning(f"{key} 로드 실패: {e}")
                     continue
-
+    
             if not all_mismatches:
                 logger.warning("유효한 mismatches 데이터가 없습니다.")
                 return {"status": "error", "message": "유효한 데이터 없음"}
-            
+
             # 데이터 통합
             merged_df = pd.concat(all_mismatches, ignore_index=True)
             logger.info(f"날짜별 파일 통합 후 총 항목 수: {len(merged_df)}개")
-            
-            # 중복 제거 전 중복 항목 분석
-            duplicate_mask = merged_df.duplicated(subset=['날짜', '부서명', '물품코드'], keep=False)
-            duplicate_items = merged_df[duplicate_mask]
-            if not duplicate_items.empty:
-                logger.warning(f"중복 항목 발견: {len(duplicate_items)}개")
-                # 중복 항목의 상위 10개 샘플 로깅
-                sample_duplicates = duplicate_items.groupby(['날짜', '부서명', '물품코드']).size().reset_index(name='중복수').head(10)
-                for _, row in sample_duplicates.iterrows():
-                    logger.warning(f"중복 예시: {row['날짜']} {row['부서명']} {row['물품코드']} - {row['중복수']}개")
-            
-            # 중복 제거 (날짜, 부서명, 물품코드 기준)
+
+            # 중복 제거
             before_dedup = len(merged_df)
             merged_df = merged_df.drop_duplicates(subset=['날짜', '부서명', '물품코드'], keep='last')
             after_dedup = len(merged_df)
-            logger.info(f"중복 제거: {before_dedup}개 → {after_dedup}개 (제거된 중복: {before_dedup - after_dedup}개)")
-            
-            # 완료 처리 로그 필터링 적용 (통합 시점에서 최종 필터링)
+            logger.info(f"중복 제거: {before_dedup}개 → {after_dedup}개")
+
+            # 완료 처리 필터링 적용
             try:
                 completion_logs_result = self.load_completion_logs()
                 if completion_logs_result["status"] == "success":
                     completion_logs = completion_logs_result["data"]
                     if completion_logs:
-                        before_completion_filter = len(merged_df)
-                        # filter_completed_items 함수 사용하여 완료된 항목 제거 (날짜 범위 없이 전체 적용)
-                        merged_df = filter_completed_items(merged_df, completion_logs)
-                        after_completion_filter = len(merged_df)
-                        logger.info(f"통합 시점 완료 처리 필터링: {before_completion_filter}개 → {after_completion_filter}개 (제외된 항목: {before_completion_filter - after_completion_filter}개)")
+                        missing_mask = merged_df['누락'].str.contains('누락', na=False) if '누락' in merged_df.columns else pd.Series([False] * len(merged_df))
+                        missing_items = merged_df[missing_mask].copy()
+                        regular_items = merged_df[~missing_mask].copy()
+    
+                        if not regular_items.empty:
+                            regular_items = filter_completed_items(regular_items, completion_logs)
+
+                        merged_df = pd.concat([regular_items, missing_items], ignore_index=True)
+                        logger.info("완료 처리 필터링 완료")
                     else:
                         logger.info("완료 처리 로그가 없어 필터링을 건너뜁니다.")
                 else:
-                    logger.warning(f"완료 처리 로그 로드 실패: {completion_logs_result.get('message', '알 수 없는 오류')}. 필터링 없이 진행합니다.")
+                    logger.warning("완료 처리 로그 로드 실패. 필터링 없이 진행합니다.")
             except Exception as filter_err:
-                logger.error(f"통합 시점 완료 처리 필터링 중 오류: {filter_err}. 필터링 없이 진행합니다.")
-            
-            # 정렬 (날짜, 부서명, 물품코드 순)
+                logger.error(f"완료 처리 필터링 중 오류: {filter_err}. 필터링 없이 진행합니다.")
+
+            # 데이터 정렬
             merged_df = merged_df.sort_values(['날짜', '부서명', '물품코드'])
-            
+
             # 저장
             full_mismatches_key = f"{self.dirs['RESULTS']}mismatches_full.json"
             json_data = merged_df.to_json(orient="records", indent=4)
@@ -623,13 +653,14 @@ class S3Handler:
                 Key=full_mismatches_key,
                 Body=json_data
             )
-            
-            logger.info(f"전체 통합 mismatches_full.json 저장 완료 (완료 처리 필터링 적용): {len(merged_df)}개 항목")
+
+            logger.info(f"전체 통합 mismatches_full.json 저장 완료: {len(merged_df)}개 항목")
             return {"status": "success", "count": len(merged_df)}
-            
+
         except Exception as e:
             logger.error(f"전체 통합 mismatches_full.json 생성 중 오류: {e}")
             return {"status": "error", "message": str(e)}
+
 
 
     def load_full_mismatches(self):
@@ -660,7 +691,7 @@ class S3Handler:
 
             # --- 썸네일 변환 (예: 400x600) ---
             img = img_obj.copy()
-            img.thumbnail((350, 500))  # 비율유지 최대 400x600
+            img.thumbnail((700, 1000))  # 비율유지 최대 400x600
 
             img_byte_arr = io.BytesIO()
             img.save(img_byte_arr, format='PNG', optimize=True, compress_level=6)
@@ -1015,8 +1046,7 @@ def filter_completed_items(mismatch_data, completion_logs, date_range=None):
     try:
         if mismatch_data.empty or not completion_logs:
             return mismatch_data
-            
-        # 날짜 범위 필터링이 지정된 경우 완료 로그를 먼저 필터링
+
         filtered_completion_logs = completion_logs
         if date_range:
             start_date, end_date = date_range
@@ -1028,9 +1058,7 @@ def filter_completed_items(mismatch_data, completion_logs, date_range=None):
                         filtered_completion_logs.append(log)
                 except:
                     continue
-            logger.info(f"완료 로그 날짜 필터링: {len(completion_logs)}개 → {len(filtered_completion_logs)}개 (기간: {start_date} ~ {end_date})")
-            
-        # 완료 처리된 항목의 고유 식별자 생성
+
         completed_items = set()
         invalid_completion_logs = 0
         for log in filtered_completion_logs:
@@ -1039,104 +1067,31 @@ def filter_completed_items(mismatch_data, completion_logs, date_range=None):
                 dept = str(log.get('부서명', ''))
                 code = str(log.get('물품코드', ''))
                 if date and dept and code:
-                    # 날짜 형식 통일 (YYYY-MM-DD)
-                    try:
-                        date = pd.to_datetime(date).strftime('%Y-%m-%d')
-                    except:
-                        invalid_completion_logs += 1
-                        continue
+                    date = pd.to_datetime(date).strftime('%Y-%m-%d')
                     completed_key = f"{date}_{dept}_{code}"
                     completed_items.add(completed_key)
                 else:
                     invalid_completion_logs += 1
-            except Exception as e:
-                logger.warning(f"완료 항목 처리 중 오류: {e}")
+            except:
                 invalid_completion_logs += 1
-                continue
-        
-        if invalid_completion_logs > 0:
-            logger.warning(f"유효하지 않은 완료 로그 {invalid_completion_logs}개 건너뜀")
-        
-        logger.info(f"완료 처리 필터링: 완료 항목 {len(completed_items)}개 생성됨")
-        
-        # 디버깅: 완료 로그와 데이터의 날짜 범위 확인
-        if filtered_completion_logs:
-            completion_dates = [log.get('날짜', '') for log in filtered_completion_logs]
-            completion_date_range = f"{min(completion_dates)} ~ {max(completion_dates)}"
-            logger.info(f"필터링된 완료 로그 날짜 범위: {completion_date_range}")
-        
-        if not mismatch_data.empty and '날짜' in mismatch_data.columns:
-            data_dates = mismatch_data['날짜'].astype(str).unique()
-            data_date_range = f"{min(data_dates)} ~ {max(data_dates)}"
-            logger.info(f"데이터 날짜 범위: {data_date_range}")
-        
-        # 완료 처리되지 않은 항목만 필터링
-        filtered_data = mismatch_data.copy()
-        
-        # 날짜 형식 확인 및 처리
-        if pd.api.types.is_datetime64_any_dtype(filtered_data['날짜']):
-            # datetime 타입인 경우 NaT 값 제거 후 문자열로 변환
-            before_nat_filter = len(filtered_data)
-            filtered_data = filtered_data.dropna(subset=['날짜'])
-            after_nat_filter = len(filtered_data)
-            
-            if before_nat_filter != after_nat_filter:
-                logger.warning(f"완료 처리 필터링 중 날짜가 없는 {before_nat_filter - after_nat_filter}개 항목 제외")
-            
-            if filtered_data.empty:
-                logger.warning("완료 처리 필터링 후 유효한 데이터가 없습니다.")
-                return filtered_data
-            
-            # datetime을 문자열로 변환
-            filtered_data['날짜_str'] = filtered_data['날짜'].dt.strftime('%Y-%m-%d')
-        else:
-            # 이미 문자열 타입인 경우 그대로 사용
-            filtered_data['날짜_str'] = filtered_data['날짜'].astype(str)
-            
-            # 빈 문자열이나 'NaT' 문자열 제거
-            before_filter = len(filtered_data)
-            filtered_data = filtered_data[
-                (filtered_data['날짜_str'] != '') & 
-                (filtered_data['날짜_str'] != 'NaT') & 
-                (filtered_data['날짜_str'].notna())
+
+        missing_mask = mismatch_data['누락'].str.contains('누락', na=False) if '누락' in mismatch_data.columns else pd.Series([False] * len(mismatch_data))
+        missing_items = mismatch_data[missing_mask].copy()
+        regular_items = mismatch_data[~missing_mask].copy()
+
+        if not regular_items.empty:
+            regular_items = regular_items[
+                ~regular_items.apply(lambda row: f"{row['날짜']}_{row['부서명']}_{row['물품코드']}", axis=1).isin(completed_items)
             ]
-            after_filter = len(filtered_data)
-            
-            if before_filter != after_filter:
-                logger.warning(f"완료 처리 필터링 중 유효하지 않은 날짜 {before_filter - after_filter}개 항목 제외")
-            
-            if filtered_data.empty:
-                logger.warning("완료 처리 필터링 후 유효한 데이터가 없습니다.")
-                return filtered_data
-        
-        # 안전한 item_key 생성 (문자열 날짜 사용)
-        filtered_data['item_key'] = filtered_data.apply(
-            lambda row: f"{row['날짜_str']}_{str(row['부서명'])}_{str(row['물품코드'])}", 
-            axis=1
-        )
-        
-        # 완료된 항목 제외
-        before_completion_filter = len(filtered_data)
-        filtered_data = filtered_data[~filtered_data['item_key'].isin(completed_items)]
-        after_completion_filter = len(filtered_data)
-        
-        logger.info(f"완료 처리 필터링 결과: {before_completion_filter}개 → {after_completion_filter}개 (제외된 항목: {before_completion_filter - after_completion_filter}개)")
-        
-        # 디버깅: 첫 5개 항목의 키 비교
-        if before_completion_filter > 0:
-            sample_keys = filtered_data['item_key'].head(5).tolist()
-            logger.info(f"샘플 데이터 키: {sample_keys}")
-            sample_completed = list(completed_items)[:5]
-            logger.info(f"샘플 완료 키: {sample_completed}")
-        
-        # 임시 컬럼 제거
-        filtered_data = filtered_data.drop(['item_key', '날짜_str'], axis=1)
-        
+
+        filtered_data = pd.concat([regular_items, missing_items], ignore_index=True)
+
         return filtered_data
-        
+
     except Exception as e:
         logger.error(f"완료 항목 필터링 중 오류 발생: {e}", exc_info=True)
         return mismatch_data
+
 
 # 삭제된 중복 함수
 # ----------------------------------------------------
@@ -1215,13 +1170,17 @@ st.markdown("""
     }
     .stTabs [data-baseweb=\"tab\"] {
         height: 50px;
-        white-space: pre-wrap;
+        white-space: normal !important; /* 자동 줄바꿈 허용 */
         background-color: #F0F2F6;
         border-radius: 4px 4px 0 0;
         padding-left: 1rem;
         padding-right: 1rem;
         /* 탭 제목 크기 명시적 설정 */
         font-size: 17px !important; /* 탭 제목 크기 유지 */
+        min-width: 100px !important; /* 탭의 최소 너비 조정 (필요한 너비로 설정 가능) */
+        word-break: keep-all; /* 단어 단위 줄바꿈 활성화 (한글 기준) */
+        padding: 0.5rem !important; /* 적당한 내부 패딩 추가 */
+        height: auto !important; /* 탭 높이 자동 조정 */
     }
     .stTabs [aria-selected=\"true\"] {
         background-color: #E0E0E0;
@@ -1282,7 +1241,7 @@ if 'completion_logs' not in st.session_state:
 
 # PDF에서 이미지 추출 함수
 @st.cache_data(ttl=3600, max_entries=100)
-def extract_pdf_preview(pdf_path_or_bytes, page_num=0, dpi=120, thumbnail_size=(400, 600)):
+def extract_pdf_preview(pdf_path_or_bytes, page_num=0, dpi=120, thumbnail_size=(700, 1000)):
     """
     PDF 파일의 특정 페이지를 썸네일(미리보기) 이미지로 추출하여 반환 (PIL.Image)
     Args:
@@ -1562,7 +1521,7 @@ def display_pdf_section(selected_date, sel_dept, tab_prefix="pdf_tab"):
         st.subheader(f"{selected_date} {sel_dept} 미리보기 (썸네일, 다중 선택)")
         
         # Form을 사용하여 체크박스 상태 변경 시 새로고침 방지
-        with st.form(key=f"{tab_prefix}_image_selection_form"):
+        with st.form(key=f"{tab_prefix}_{selected_date}_image_selection_form"):
             cols = st.columns(2)
             page_checkbox_keys = []
             page_img_objs = []
@@ -1572,7 +1531,7 @@ def display_pdf_section(selected_date, sel_dept, tab_prefix="pdf_tab"):
                     img = extract_pdf_preview(io.BytesIO(pdf_bytes), page_num-1, dpi=120, thumbnail_size=(700, 1000))
                     if img is not None:
                         st.image(img, caption=f"p.{page_num}", width=650)
-                        cb_key = f"{tab_prefix}_{selected_date}_{sel_dept}_{page_num}"
+                        cb_key = f"{tab_prefix}_{selected_date}_{page_num}"
                         
                         # 체크박스 표시 (Form 내부에서 새로고침 없이 동작)
                         checked = st.checkbox(
@@ -2014,6 +1973,9 @@ def main():
         st.session_state.departments_with_pages_by_date = {}
     if 'loaded_dates' not in st.session_state:
         st.session_state.loaded_dates = set()  # 이미 로드된 날짜를 추적하기 위한 세트
+    if 'item_db' not in st.session_state:
+        st.session_state.item_db = {}  # 물품 DB 초기화 추가
+
     
     # 완료 처리 로그 로드 (앱 시작 시)
     if 'completion_logs' not in st.session_state:
@@ -2033,6 +1995,26 @@ def main():
         except Exception as e:
             st.session_state.completion_logs = []
             logger.error(f"앱 시작 시 완료 처리 로그 로드 중 심각한 예외 발생: {e}", exc_info=True)
+    else:
+        # 세션에 이미 있어도 S3에서 최신 데이터 강제 로드
+        try:
+            s3_handler = S3Handler()
+            completion_logs_result = s3_handler.load_completion_logs()
+            
+            if completion_logs_result["status"] == "success":
+                # S3 데이터와 세션 데이터 비교
+                s3_logs = completion_logs_result["data"]
+                session_logs = st.session_state.completion_logs
+                
+                if len(s3_logs) != len(session_logs):
+                    logger.info(f"S3와 세션의 완료 로그 수가 다름 (S3: {len(s3_logs)}, 세션: {len(session_logs)}). S3 데이터로 업데이트.")
+                    st.session_state.completion_logs = s3_logs
+                else:
+                    logger.info(f"완료 처리 로그 이미 로드됨: {len(session_logs)}개 항목")
+            else:
+                logger.warning(f"S3에서 완료 로그 재로드 실패: {completion_logs_result.get('message')}")
+        except Exception as e:
+            logger.error(f"완료 로그 재로드 중 오류: {e}")
     
     # 한글 폰트 설정
     set_korean_font()
@@ -2067,6 +2049,10 @@ def main():
     # 불일치 데이터 재계산은 필요한 경우에만 수행 (예: 파일 업로드 후)
     # process_files 함수 내부에서 재계산 로직 호출
     
+    # 이미 처리된 날짜를 추적하는 세션 변수 추가
+    if 'metadata_updated_dates' not in st.session_state:
+        st.session_state.metadata_updated_dates = set()
+
     # PDF 키 누락된 메타데이터 수정
     if 'available_dates' in st.session_state:
         for date in st.session_state.available_dates:
@@ -2226,7 +2212,6 @@ def process_files(excel_files, pdf_files):
         processed_dates = set() # 날짜 중복 방지를 위해 set 사용
         current_excel_data = pd.DataFrame()
         cumulative_excel_key = f"{S3_DIRS['EXCEL']}latest/cumulative_excel.xlsx"
-
         # --- 1. 기존 누적 엑셀 데이터 로드 시도 --- 
         st.write("기존 누적 엑셀 데이터 로드를 시도합니다...")
         try:
@@ -2287,7 +2272,9 @@ def process_files(excel_files, pdf_files):
                         newly_processed_excel_files.append(uploaded_excel_file.name)
                     else:
                         st.warning(f"엑셀 파일 '{uploaded_excel_file.name}' 로드 실패: {new_data_result['message']}")
-                        logger.warning(f"엑셀 파일 '{uploaded_excel_file.name}' 로드 실패, 병합 건너<0xEB><0x9B><0x84>: {new_data_result['message']}")
+                        logger.warning(f"엑셀 파일 '{uploaded_excel_file.name}' 로드 실패, 병합 건너뜀: {new_data_result['message']}")
+                        
+                    newly_processed_excel_files.append(uploaded_excel_file.name)
                 except Exception as e:
                     logger.error(f"엑셀 파일 '{uploaded_excel_file.name}' 처리 중 오류: {e}", exc_info=True)
                     st.error(f"엑셀 파일 '{uploaded_excel_file.name}' 처리 중 오류가 발생했습니다.")
@@ -2491,9 +2478,10 @@ def process_files(excel_files, pdf_files):
                         new_mismatch_data = filter_completed_items(new_mismatch_data, completion_logs)
 
                     st.session_state.mismatch_data = new_mismatch_data.reset_index(drop=True)
-
-                    # 🚩🚩🚩 [중요] 날짜별로 각각 S3에 저장 (YYYY-MM-DD 폴더에!)
-                    save_all_date_mismatches(s3_handler, st.session_state.mismatch_data)
+                    
+                    # 통합 파일 업데이트 제거 - 사용자가 부서별 통계 탭에서 직접 병합 버튼을 눌러야 함
+                    # 날짜별 S3 저장은 이미 위에서 완료됨
+                    logger.info("날짜별 S3 저장 완료. 통합 파일 업데이트는 부서별 통계 탭에서 수동으로 수행하세요.")
 
                 else:
                     st.session_state.mismatch_data = pd.DataFrame()
@@ -2518,13 +2506,10 @@ def process_files(excel_files, pdf_files):
                     metadata = {} # 기존 메타데이터 없음
                 
                 # 엑셀 정보 업데이트 (누적 파일 기준)
+                # 엑셀 정보 업데이트 (누적 파일 기준)
                 metadata["excel_key"] = cumulative_excel_key
                 metadata["excel_hash"] = cumulative_excel_hash # 위에서 계산한 누적 해시
-                metadata["excel_processed_files"] = newly_processed_excel_files # 이번 실행에서 처리한 파일 목록
-                
-                # PDF 정보 업데이트 (이미 처리된 정보가 있다면 유지)
-                if date_str in st.session_state.pdf_paths_by_date:
-                    metadata["pdf_key"] = st.session_state.pdf_paths_by_date[date_str]
+                metadata["excel_processed_files"] = newly_processed_excel_files # 이번 실행에서 처리한 파일 목록tr]
                 if date_str in st.session_state.ocr_results_by_date:
                     ocr_data = st.session_state.ocr_results_by_date[date_str]
                     metadata["pdf_filename"] = metadata.get("pdf_filename", "N/A") # 이전 값 유지 시도
@@ -2670,8 +2655,17 @@ def display_mismatch_tab(): # selected_date 인자 제거
             
         dept_options = dept_result["data"]
         
-        # 5) 부서별 서브탭 생성
-        dept_tabs = st.tabs(["전체"] + dept_options)
+        # PDF의 부서 목록도 가져오기
+        pdf_depts = set()
+        if selected_date_in_tab in st.session_state.get('departments_with_pages_by_date', {}):
+            dept_page_tuples = st.session_state.departments_with_pages_by_date[selected_date_in_tab]
+            pdf_depts = {dept for dept, page in dept_page_tuples}
+        
+        # 불일치 데이터가 있는 부서와 PDF에만 있는 부서를 모두 포함
+        all_dept_options = sorted(list(set(dept_options) | pdf_depts))
+        
+        # 5) 부서별 서브탭 생성 (모든 부서 포함)
+        dept_tabs = st.tabs(["전체"] + all_dept_options)
         
         # 전체 탭 (일괄 처리 + 부서 비교 전용)
         with dept_tabs[0]:
@@ -2784,11 +2778,8 @@ def display_mismatch_tab(): # selected_date 인자 제거
                             all_indices_to_remove
                         ).reset_index(drop=True)
                         
-                        # 날짜별로 분리하여 S3에 저장 (통합 작업 제거로 속도 향상)
-                        save_all_date_mismatches(s3_handler, st.session_state.mismatch_data)
-                        
-                        # 전체 통합 파일 업데이트 제거 (부서별 통계 탭에서 수동 병합)
-                        # s3_handler.update_full_mismatches_json()  # 주석 처리
+                        # 전산누락 저장 시에만 필요한 자동 통합 작업 제거
+                        # 사용자가 명시적으로 부서별 통계 탭에서 병합 버튼을 누르도록 유도
                         
                         # 완료 처리 로그 저장
                         if all_completed_items:
@@ -2824,6 +2815,7 @@ def display_mismatch_tab(): # selected_date 인자 제거
                 st.info("💡 각 부서 탭에서 완료 처리할 항목을 선택해주세요.")
             
             st.markdown("---")
+
             
             # 엑셀과 PDF의 부서 비교
             st.subheader("📋 PDF & 엑셀 부서 비교")
@@ -2882,11 +2874,11 @@ def display_mismatch_tab(): # selected_date 인자 제거
                                                 img = extract_pdf_preview(
                                                     io.BytesIO(pdf_bytes), 
                                                     page_num-1, 
-                                                    dpi=100, 
-                                                    thumbnail_size=(400, 600)
+                                                    dpi=120, 
+                                                    thumbnail_size=(700, 1000)
                                                 )
                                                 if img:
-                                                    st.image(img, caption=f"페이지 {page_num}", width=300)
+                                                    st.image(img, caption=f"페이지 {page_num}")
                                         
                                         if len(dept_pages) > 2:
                                             st.info(f"총 {len(dept_pages)}개 페이지 중 2개만 표시됨")
@@ -2906,9 +2898,17 @@ def display_mismatch_tab(): # selected_date 인자 제거
                 st.error("부서 비교 중 오류가 발생했습니다.")
         
         # 각 부서별 탭
-        for i, dept in enumerate(dept_options, 1):
+        for i, dept in enumerate(all_dept_options, 1):
             with dept_tabs[i]:
-                df_filtered_dept = df_date[df_date['부서명'] == dept].copy() # df_filtered 대신 df_filtered_dept 사용
+                # 불일치 데이터가 있는 부서인지 확인
+                if dept in dept_options:
+                    df_filtered_dept = df_date[df_date['부서명'] == dept].copy()
+                else:
+                    # PDF에만 있는 부서 (불일치 데이터 없음)
+                    df_filtered_dept = pd.DataFrame()
+                    st.info(f"ℹ️ '{dept}' 부서의 전산 누락 품목을 확인할 수 있습니다.")
+                    st.warning("💡 아래에서 PDF 품목을 확인하고 필요시 전산누락으로 저장할 수 있습니다.")
+                    st.caption("완료 처리로 인해 불일치가 모두 해결된 경우에도 이 메시지가 나타날 수 있습니다.")
                 
                 st.subheader("PDF & 엑셀 품목 비교")
                 try:
@@ -2983,10 +2983,21 @@ def display_mismatch_tab(): # selected_date 인자 제거
 
                                             if save_detected_missing_button:
                                                 try:
+                                                    # 캐시 클리어 추가
+                                                    st.cache_data.clear()
+                                                    
+                                                    # 전산누락 저장 전 디버깅 정보
+                                                    logger.info(f"전산누락 저장 시작 - 날짜: {selected_date_in_tab}, 부서: {dept}, 항목 수: {len(missing_df)}")
+                                                    logger.info(f"전산누락 데이터 샘플: {missing_df[['날짜', '부서명', '물품코드', '누락']].head().to_dict('records')}")
+                                                    
                                                     s3_handler = S3Handler()
                                                     result = s3_handler.save_missing_items_by_date(missing_df, date_str=selected_date_in_tab)
+                                                    
+                                                    logger.info(f"전산누락 S3 저장 결과: {result['status']} - {result.get('message', '')}")
+                                                    
                                                     if result["status"] == "success":
                                                         # 세션 상태의 mismatch_data도 업데이트
+                                                        
                                                         if 'mismatch_data' not in st.session_state:
                                                             st.session_state.mismatch_data = pd.DataFrame()
                                                         
@@ -2996,7 +3007,15 @@ def display_mismatch_tab(): # selected_date 인자 제거
                                                         combined_session = combined_session.drop_duplicates(subset=['날짜', '부서명', '물품코드'], keep='last')
                                                         st.session_state.mismatch_data = combined_session
                                                         
-                                                        st.success(f"{len(missing_df)}개 전산누락 항목 저장 완료.")
+                                                        # 강제 새로고침 플래그 설정 (부서별 통계 탭 자동 업데이트)
+                                                        st.session_state.force_refresh = True
+                                                        
+                                                        st.success(f"{len(missing_df)}개 전산누락 항목이 저장되었습니다!")
+                                                        st.info("💡 부서별 통계 탭에서 '날짜별 작업 내용 병합' 버튼을 눌러 확인하세요.")
+                                                        
+                                                        # 페이지 새로고침으로 즉시 반영
+                                                        # time.sleep(1)  # 잠시 대기 후 새로고침
+                                                        # st.rerun()
                                                 except Exception as e:
                                                     st.error(f"전산누락 저장 중 오류: {e}")
                                                     logger.error(f"전산누락 저장 중 오류: {e}", exc_info=True)
@@ -3012,11 +3031,9 @@ def display_mismatch_tab(): # selected_date 인자 제거
                     # df_filtered는 이미 이 try블록 외부에서 해당 dept로 필터링된 데이터로 존재함
 
                 # 최종적으로 df_filtered_dept를 사용해 display_mismatch_content 호출
-                if df_filtered_dept.empty: 
-                    st.info(f"{dept} 부서에는 불일치 데이터가 없습니다.")
-                else:
-                    display_mismatch_content(df_filtered_dept, selected_date_in_tab, dept, s3_handler) # df_filtered_dept, selected_date_in_tab
-                
+                # 불일치 데이터가 없어도 전산누락 확인을 위해 항상 호출
+                display_mismatch_content(df_filtered_dept, selected_date_in_tab, dept, s3_handler)
+                # display_pdf_section 중복 호출 제거 - display_mismatch_content 내부에서 이미 호출됨
     except Exception as e:
         logger.error(f"display_mismatch_tab 오류: {e}", exc_info=True)
         st.error(f"데이터 표시 중 오류가 발생했습니다: {e}")
@@ -3055,178 +3072,172 @@ def display_mismatch_content(df_filtered, selected_date, sel_dept, s3_handler):
         if 'original_index' not in df_filtered.columns:
             df_filtered['original_index'] = df_filtered.index
             
-        if df_filtered.empty:
-            st.info(f"'{sel_dept}' 부서에는 불일치 데이터가 없습니다.")
-            return
+        # 불일치 데이터가 없어도 계속 진행 (전산누락 확인을 위해)
+        if not df_filtered.empty:
+            st.markdown("**완료 처리할 항목을 선택하세요.**")
             
-        st.markdown("**완료 처리할 항목을 선택하세요.**")
-        
-        # 선택 저장 form (체크박스 포함)
-        form_key_selection = f"selection_form_{selected_date}_{sel_dept}"
-        with st.form(key=form_key_selection):
-            # '누락' 열을 포함하여 widths 리스트 수정 (총 9개 열)
-            widths = [0.5, 1.2, 0.8, 0.8, 2.5, 0.7, 0.7, 0.7, 1] 
-            
-            # 헤더 표시
-            header_cols = st.columns(widths)
-            column_names = ["선택", "날짜", "부서명", "물품코드", "물품명", "청구량", "수령량", "차이", "누락"]
-            for i, name in enumerate(column_names):
-                if i < len(header_cols):
-                    header_cols[i].markdown(f"**{name}**")
-            
-            # 체크박스와 데이터 표시 (form 안에서)
-            selected_items = []
-            for idx, row in df_filtered.iterrows():
-                try:
-                    date_val = pd.to_datetime(row.get('날짜', 'N/A')).strftime('%Y-%m-%d')
-                except:
-                    date_val = str(row.get('날짜', 'N/A'))
+            # 선택 저장 form (체크박스 포함)
+            form_key_selection = f"selection_form_{selected_date}_{sel_dept}"
+            with st.form(key=form_key_selection):
+                # '누락' 열을 포함하여 widths 리스트 수정 (총 9개 열)
+                widths = [0.5, 1.2, 0.8, 0.8, 2.5, 0.7, 0.7, 0.7, 1] 
+                
+                # 헤더 표시
+                header_cols = st.columns(widths)
+                column_names = ["선택", "날짜", "부서명", "물품코드", "물품명", "청구량", "수령량", "차이", "누락"]
+                for i, name in enumerate(column_names):
+                    if i < len(header_cols):
+                        header_cols[i].markdown(f"**{name}**")
+                
+                # 체크박스와 데이터 표시 (form 안에서)
+                selected_items = []
+                for idx, row in df_filtered.iterrows():
+                    try:
+                        date_val = pd.to_datetime(row.get('날짜', 'N/A')).strftime('%Y-%m-%d')
+                    except:
+                        date_val = str(row.get('날짜', 'N/A'))
+                        
+                    dept_key_val = str(row.get('부서명', 'N/A'))
+                    code_key_val = str(row.get('물품코드', 'N/A'))
+                    # 전체 탭과 동일한 키 형식 사용 (부서 접미사 제거)
+                    state_key = f"sel_{date_val}_{dept_key_val}_{code_key_val}"
                     
-                dept_key_val = str(row.get('부서명', 'N/A'))
-                code_key_val = str(row.get('물품코드', 'N/A'))
-                # 전체 탭과 동일한 키 형식 사용 (부서 접미사 제거)
-                state_key = f"sel_{date_val}_{dept_key_val}_{code_key_val}"
+                    cols = st.columns(widths)
+                    # label을 고유하게 만들고 숨김 처리
+                    checkbox_label = f"select_{state_key}"
+                    is_selected = cols[0].checkbox(
+                        label=checkbox_label, 
+                        key=f"{form_key_selection}_{state_key}",  # form 내부 고유 키 사용
+                        value=st.session_state.get(state_key, False),
+                        label_visibility="collapsed"
+                    )
+                    
+                    if is_selected:
+                        selected_items.append((state_key, row))
+                    
+                    try:
+                        # 각 컬럼에 해당하는 값을 안전하게 가져와서 표시
+                        col_values = [
+                            date_val,
+                            dept_key_val,
+                            code_key_val,
+                            str(row.get('물품명', row.get('품목', 'N/A'))),
+                            str(row.get('청구량', 'N/A')),
+                            str(row.get('수령량', 'N/A')),
+                            str(row.get('차이', 'N/A')),
+                            str(row.get('누락', ''))
+                        ]
+                        for i, value in enumerate(col_values):
+                            if (i + 1) < len(cols):
+                                cols[i+1].write(value)
+                    except Exception as row_err:
+                        logger.error(f"불일치 리스트 행 값 표시 오류 (인덱스: {idx}, 데이터: {row.to_dict()}): {row_err}")
+                        # 오류 발생 시 대체 텍스트 표시 (선택 열 제외)
+                        for i in range(1, len(cols)):
+                            cols[i].write("-")
                 
-                cols = st.columns(widths)
-                # label을 고유하게 만들고 숨김 처리
-                checkbox_label = f"select_{state_key}"
-                is_selected = cols[0].checkbox(
-                    label=checkbox_label, 
-                    key=f"{form_key_selection}_{state_key}",  # form 내부 고유 키 사용
-                    value=st.session_state.get(state_key, False),
-                    label_visibility="collapsed"
-                )
-                
-                if is_selected:
-                    selected_items.append((state_key, row))
-                
-                try:
-                    # 각 컬럼에 해당하는 값을 안전하게 가져와서 표시
-                    col_values = [
-                        date_val,
-                        dept_key_val,
-                        code_key_val,
-                        str(row.get('물품명', row.get('품목', 'N/A'))),
-                        str(row.get('청구량', 'N/A')),
-                        str(row.get('수령량', 'N/A')),
-                        str(row.get('차이', 'N/A')),
-                        str(row.get('누락', ''))
-                    ]
-                    for i, value in enumerate(col_values):
-                        if (i + 1) < len(cols):
-                            cols[i+1].write(value)
-                except Exception as row_err:
-                    logger.error(f"불일치 리스트 행 값 표시 오류 (인덱스: {idx}, 데이터: {row.to_dict()}): {row_err}")
-                    # 오류 발생 시 대체 텍스트 표시 (선택 열 제외)
-                    for i in range(1, len(cols)):
-                        cols[i].write("-")
-            
-            st.markdown("---")
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                save_selection_button = st.form_submit_button("💾 선택 저장", type="secondary", 
-                                                            help="체크박스 선택을 세션에 저장합니다 (UI 새로고침 없음)")
-            with col2:
-                immediate_complete_button = st.form_submit_button("✅ 즉시 완료 처리", type="primary",
-                                                                help="선택한 항목을 바로 완료 처리합니다 (UI 새로고침 발생)")
+                st.markdown("---")
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    save_selection_button = st.form_submit_button("💾 선택 저장", type="secondary", 
+                                                                help="체크박스 선택을 세션에 저장합니다 (UI 새로고침 없음)")
+                with col2:
+                    immediate_complete_button = st.form_submit_button("✅ 즉시 완료 처리", type="primary",
+                                                                    help="선택한 항목을 바로 완료 처리합니다 (UI 새로고침 발생)")
 
-            # 선택 저장 처리 (UI 새로고침 없음, S3 작업 없음) - 최적화됨
-            if save_selection_button:
-                # 1. 선택된 항목들의 키 집합 생성 (빠른 검색용)
-                selected_keys = {state_key for state_key, row in selected_items}
-                
-                # 2. 선택된 항목들을 True로 설정
-                for state_key in selected_keys:
-                    st.session_state[state_key] = True
-                
-                # 3. 선택되지 않은 항목들을 False로 설정 (최적화)
-                # 날짜 변환을 한 번만 수행
-                try:
-                    date_val = pd.to_datetime(df_filtered['날짜'].iloc[0]).strftime('%Y-%m-%d')
-                except:
-                    date_val = str(df_filtered['날짜'].iloc[0])
-                
-                dept_key_val = str(df_filtered['부서명'].iloc[0])  # 같은 부서이므로 첫 번째 값 사용
-                
-                # 벡터화된 키 생성
-                code_values = df_filtered['물품코드'].astype(str)
-                all_keys = {f"sel_{date_val}_{dept_key_val}_{code}" for code in code_values}
-                
-                # 선택되지 않은 키들만 False로 설정
-                unselected_keys = all_keys - selected_keys
-                for key in unselected_keys:
-                    st.session_state[key] = False
-                
-                # 4. 선택 저장 완료 플래그 설정 (전체 탭에서 확인용)
-                if 'saved_selections' not in st.session_state:
-                    st.session_state.saved_selections = {}
-                st.session_state.saved_selections[f"{selected_date}_{sel_dept}"] = len(selected_items)
-                
-                st.success(f"✅ {len(selected_items)}개 항목 선택이 저장되었습니다. 전체 탭에서 일괄 처리하세요.")
-                st.info("💡 이 작업은 세션에만 저장되며 S3 작업이 없어 빠릅니다.")
+                # 선택 저장 처리 (UI 새로고침 없음, S3 작업 없음) - 최적화됨
+                if save_selection_button:
+                    # 1. 선택된 항목들의 키 집합 생성 (빠른 검색용)
+                    selected_keys = {state_key for state_key, row in selected_items}
+                    
+                    # 2. 선택된 항목들을 True로 설정
+                    for state_key in selected_keys:
+                        st.session_state[state_key] = True
+                    
+                    # 3. 선택되지 않은 항목들을 False로 설정 (최적화)
+                    # 날짜 변환을 한 번만 수행
+                    try:
+                        date_val = pd.to_datetime(df_filtered['날짜'].iloc[0]).strftime('%Y-%m-%d')
+                    except:
+                        date_val = str(df_filtered['날짜'].iloc[0])
+                    
+                    dept_key_val = str(df_filtered['부서명'].iloc[0])  # 같은 부서이므로 첫 번째 값 사용
+                    
+                    # 벡터화된 키 생성
+                    code_values = df_filtered['물품코드'].astype(str)
+                    all_keys = {f"sel_{date_val}_{dept_key_val}_{code}" for code in code_values}
+                    
+                    # 선택되지 않은 키들만 False로 설정
+                    unselected_keys = all_keys - selected_keys
+                    for key in unselected_keys:
+                        st.session_state[key] = False
+                    
+                    # 4. 선택 저장 완료 플래그 설정 (전체 탭에서 확인용)
+                    if 'saved_selections' not in st.session_state:
+                        st.session_state.saved_selections = {}
+                    st.session_state.saved_selections[f"{selected_date}_{sel_dept}"] = len(selected_items)
+                    
+                    st.success(f"✅ {len(selected_items)}개 항목 선택이 저장되었습니다. 전체 탭에서 일괄 처리하세요.")
+                    st.info("💡 이 작업은 세션에만 저장되며 S3 작업이 없어 빠릅니다.")
 
-            # 즉시 완료 처리 (S3 작업 포함, 시간 소요)
-            if immediate_complete_button:
-                if selected_items:
-                    with st.spinner("완료 처리 중... (S3 저장 및 통합 작업 수행)"):
-                        items_to_remove_keys = []
-                        items_to_remove_indices = []
-                        completed_items = []
+                # 즉시 완료 처리 (S3 작업 포함, 시간 소요)
+                if immediate_complete_button:
+                    if selected_items:
+                        with st.spinner("완료 처리 중... (S3 저장 및 통합 작업 수행)"):
+                            items_to_remove_keys = []
+                            items_to_remove_indices = []
+                            completed_items = []
 
-                    for state_key, row in selected_items:
-                        try:
-                            date_k = pd.to_datetime(row.get('날짜', 'N/A')).strftime('%Y-%m-%d')
-                        except:
-                            date_k = str(row.get('날짜', 'N/A'))
+                        for state_key, row in selected_items:
+                            try:
+                                date_k = pd.to_datetime(row.get('날짜', 'N/A')).strftime('%Y-%m-%d')
+                            except:
+                                date_k = str(row.get('날짜', 'N/A'))
+                                
+                            dept_k = str(row.get('부서명', 'N/A'))
+                            code_k = str(row.get('물품코드', 'N/A'))
+                            original_idx = row['original_index']
                             
-                        dept_k = str(row.get('부서명', 'N/A'))
-                        code_k = str(row.get('물품코드', 'N/A'))
-                        original_idx = row['original_index']
-                        
-                        items_to_remove_keys.append(state_key)
-                        items_to_remove_indices.append(original_idx)
-                        completed_items.append({
-                            '날짜': date_k,
-                            '부서명': dept_k,
-                            '물품코드': code_k,
-                            '물품명': row.get('물품명', 'N/A'),
-                            '청구량': row.get('청구량', 0),
-                            '수령량': row.get('수령량', 0),
-                            '차이': row.get('차이', 0),
-                            '누락': row.get('누락', ''),
-                            '처리시간': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            'original_index': original_idx
-                        })
+                            items_to_remove_keys.append(state_key)
+                            items_to_remove_indices.append(original_idx)
+                            completed_items.append({
+                                '날짜': date_k,
+                                '부서명': dept_k,
+                                '물품코드': code_k,
+                                '물품명': row.get('물품명', 'N/A'),
+                                '청구량': row.get('청구량', 0),
+                                '수령량': row.get('수령량', 0),
+                                '차이': row.get('차이', 0),
+                                '누락': row.get('누락', ''),
+                                '처리시간': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'original_index': original_idx
+                            })
 
-                    if items_to_remove_indices:
-                        st.session_state.mismatch_data = st.session_state.mismatch_data.drop(items_to_remove_indices).reset_index(drop=True)
-                        
-                        # 날짜별로 분리하여 S3에 저장 (통합 작업 제거로 속도 향상)
-                        save_all_date_mismatches(s3_handler, st.session_state.mismatch_data)
-                        
-                        # 전체 통합 파일 업데이트 제거 (부서별 통계 탭에서 수동 병합)
-                        # s3_handler.update_full_mismatches_json()  # 주석 처리
-                        
-                        if completed_items:
-                            # S3에 저장
-                            log_result = s3_handler.save_completion_log(completed_items)
-                            if log_result["status"] != "success":
-                                st.warning("완료 처리 로그 저장에 실패했습니다.")
+                        if items_to_remove_indices:
+                            st.session_state.mismatch_data = st.session_state.mismatch_data.drop(items_to_remove_indices).reset_index(drop=True)
+                                                   
+                                   
                             
-                            # 세션 상태에도 완료 처리 로그 추가
-                            if 'completion_logs' not in st.session_state:
-                                st.session_state.completion_logs = []
-                            st.session_state.completion_logs.extend(completed_items)
+                            if completed_items:
+                                # S3에 저장
+                                log_result = s3_handler.save_completion_log(completed_items)
+                                if log_result["status"] != "success":
+                                    st.warning("완료 처리 로그 저장에 실패했습니다.")
+                                
+                                # 세션 상태에도 완료 처리 로그 추가
+                                if 'completion_logs' not in st.session_state:
+                                    st.session_state.completion_logs = []
+                                st.session_state.completion_logs.extend(completed_items)
+                                
+                                # 중복 제거
+                                if st.session_state.completion_logs:
+                                    temp_df = pd.DataFrame(st.session_state.completion_logs)
+                                    if '처리시간' in temp_df.columns:
+                                        temp_df['처리시간'] = pd.to_datetime(temp_df['처리시간'])
+                                        temp_df = temp_df.sort_values('처리시간', ascending=False)
+                                        temp_df = temp_df.drop_duplicates(subset=['날짜', '부서명', '물품코드'], keep='first')
+                                        st.session_state.completion_logs = temp_df.to_dict('records')
                             
-                            # 중복 제거
-                            if st.session_state.completion_logs:
-                                temp_df = pd.DataFrame(st.session_state.completion_logs)
-                                if '처리시간' in temp_df.columns:
-                                    temp_df['처리시간'] = pd.to_datetime(temp_df['처리시간'])
-                                    temp_df = temp_df.sort_values('처리시간', ascending=False)
-                                    temp_df = temp_df.drop_duplicates(subset=['날짜', '부서명', '물품코드'], keep='first')
-                                    st.session_state.completion_logs = temp_df.to_dict('records')
-                        
                         # 세션 정리 (완료 처리된 항목들)
                         for key in items_to_remove_keys:
                             if key in st.session_state:
@@ -3237,16 +3248,16 @@ def display_mismatch_content(df_filtered, selected_date, sel_dept, s3_handler):
                             key_to_remove = f"{selected_date}_{sel_dept}"
                             if key_to_remove in st.session_state.saved_selections:
                                 del st.session_state.saved_selections[key_to_remove]
-                    
+                        
                     st.success(f"✅ {len(items_to_remove_indices)}개 항목이 완료 처리되었습니다. (날짜별 저장 완료)")
                     st.info("💡 부서별 통계를 보려면 '날짜별 작업 내용 병합' 버튼을 눌러주세요.")
                 else:
                     st.warning("완료 처리할 항목을 선택하세요.")
 
-        # PDF 섹션 표시
-        st.markdown("---")
-        display_pdf_section(selected_date, sel_dept, tab_prefix=f"mismatch_tab_{sel_dept}")
-        
+            # PDF 섹션 표시 - 불일치 데이터 유무와 관계없이 항상 표시
+            st.markdown("---")
+            display_pdf_section(selected_date, sel_dept, tab_prefix=f"mismatch_tab_{sel_dept}")
+            
     except Exception as e:
         logger.error(f"display_mismatch_content 오류: {e}", exc_info=True)
         st.error(f"데이터 표시 중 오류가 발생했습니다: {e}")
@@ -3254,18 +3265,31 @@ def display_mismatch_content(df_filtered, selected_date, sel_dept, s3_handler):
 
 def display_filter_tab():
     st.header("부서별 통계 (불일치 및 누락 항목)")
+    if st.session_state.get('force_refresh', False):
+        if hasattr(st, 'cache_data'):
+            st.cache_data.clear()
+        st.session_state.force_refresh = False
 
     # 1. 사이드바 기간 설정 확인
     if 'work_start_date' not in st.session_state or 'work_end_date' not in st.session_state:
         st.warning("작업 기간을 설정하세요 (사이드바에서).")
         return
+    # 사이드바의 현재 날짜 범위 가져오기
+    current_start_date = st.session_state.get('date_input_start')
+    current_end_date = st.session_state.get('date_input_end')
     
+    if current_start_date and current_end_date:
+        st.session_state.work_start_date = current_start_date
+        st.session_state.work_end_date = current_end_date
+
     s3_handler = S3Handler()
     
     # 2. 데이터 관리 버튼들
     col1, col2, col3 = st.columns([2, 1, 1])
     with col2:
         if st.button("📊 날짜별 작업 내용 병합", help="각 날짜별 mismatches.json을 통합하여 mismatches_full.json 생성"):
+            # 캐시 강제 클리어
+            st.cache_data.clear()
             with st.spinner("날짜별 작업 내용을 병합하는 중..."):
                 update_result = s3_handler.update_full_mismatches_json()
                 if update_result["status"] == "success":
@@ -3282,24 +3306,28 @@ def display_filter_tab():
             # if 'mismatch_data' in st.session_state:
             #     del st.session_state.mismatch_data  # 주석 처리
             
-            # 캐시 클리어 (필요시)
-            st.cache_data.clear()
-            
+                                                        
             # 새로고침 플래그 설정 (rerun 제거)
             st.session_state.force_refresh = True
             st.success("데이터 새로고침이 완료되었습니다.")
     
     # S3에서 기존 통합 데이터 로드 (자동 통합 작업 제거)
     with st.spinner("S3에서 통합 데이터를 로드하는 중..."):
-        # 강제 새로고침 플래그 초기화 (통합 작업은 별도 버튼에서 수행)
+        # 강제 새로고침 플래그 처리 (전산누락 저장 후 자동 업데이트)
         if st.session_state.get('force_refresh', False):
             st.session_state.force_refresh = False
+            # 캐시 클리어하여 최신 데이터 로드 보장
+            st.cache_data.clear()
+            st.info("🔄 전산누락 저장으로 인한 자동 데이터 새로고침")
         
-        # 기존 통합 파일만 로드 (통합 작업 없음)
+        # 기존 통합 파일만 로드 (통합 작업 없음) - 항상 S3에서 최신 데이터 로드
         df_full = s3_handler.load_full_mismatches()
         if df_full is None or df_full.empty:
             st.info("불일치 또는 누락 데이터가 없습니다.\n\n먼저 '날짜별 작업' 탭에서 데이터를 처리하거나 '날짜별 작업 내용 병합' 버튼을 눌러주세요.")
             return
+        
+        # S3에서 로드한 데이터 정보 표시
+        st.info(f"📊 S3에서 로드된 통합 데이터: {len(df_full)}개 항목")
     
     # 사이드바 날짜 범위에 해당하는 완료 처리 로그만 사용하여 필터링
     try:
@@ -3348,6 +3376,14 @@ def display_filter_tab():
     )
     date_filtered_df = filtered_df.loc[mask].copy()
     
+    # ★★★ 추가: 부서명 공백 스트립! ★★★
+    date_filtered_df['부서명'] = date_filtered_df['부서명'].astype(str).str.strip()
+    
+    # ===> 여기에 삽입 <===
+    print(date_filtered_df[date_filtered_df['부서명'].str.strip() == "11층병동"])
+    st.write(date_filtered_df[date_filtered_df['부서명'].str.strip() == "11층병동"])
+
+
     # 기간 필터링 결과 간단 표시
     if not date_filtered_df.empty:
         filtered_date_min = date_filtered_df['날짜_dt'].min().strftime('%Y-%m-%d')
@@ -3365,7 +3401,7 @@ def display_filter_tab():
     if selected_dept == "전체":
         view_df = date_filtered_df
     else:
-        view_df = date_filtered_df[date_filtered_df['부서명'] == selected_dept]
+        view_df = date_filtered_df[date_filtered_df['부서명'].str.strip() == selected_dept]
 
     # 10. 최종 컬럼 정리 및 데이터 표시
     display_columns = ['날짜', '부서명', '물품코드', '물품명', '청구량', '수령량', '차이', '누락']
@@ -3401,7 +3437,14 @@ def display_filter_tab():
         st.session_state.last_filter_state = current_filter_state
 
     # 처리된 데이터프레임 표시
-    st.dataframe(st.session_state.processed_view_df, use_container_width=True)
+    st.dataframe(
+        st.session_state.processed_view_df, 
+        use_container_width=True,
+        column_config={
+            "수령량": st.column_config.NumberColumn(format="%d"),
+            "PDF수량": st.column_config.NumberColumn(format="%d")
+        }
+    )
 
     # 11. 통계 요약
     st.markdown("---")
@@ -3415,6 +3458,13 @@ def display_filter_tab():
         # 전산누락 항목 수 계산
         missing_count = st.session_state.processed_view_df.loc[:, '누락'].str.contains('누락', na=False).sum()
         st.metric("전산누락 품목", missing_count)
+        
+        # 전산누락 데이터 디버깅 정보 (개발용)
+        if missing_count > 0:
+            missing_dates = st.session_state.processed_view_df[
+                st.session_state.processed_view_df.loc[:, '누락'].str.contains('누락', na=False)
+            ]['날짜'].unique()
+            st.caption(f"전산누락 발견 날짜: {', '.join(sorted(missing_dates))}")
     with col3:
         # 기본 불일치 vs 전산누락 비율
         total_items = len(st.session_state.processed_view_df)
@@ -3481,6 +3531,23 @@ def display_completed_items_tab():
     try:
         st.header("완료 처리된 항목")
         
+        # S3에서 최신 데이터 로드 버튼 추가
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("🔄 S3에서 최신 데이터 로드", help="S3에서 완료 처리 로그를 다시 로드합니다"):
+                try:
+                    s3_handler = S3Handler()
+                    completion_logs_result = s3_handler.load_completion_logs()
+                    
+                    if completion_logs_result["status"] == "success":
+                        st.session_state.completion_logs = completion_logs_result["data"]
+                        st.success(f"✅ S3에서 {len(st.session_state.completion_logs)}개 완료 로그를 로드했습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ S3 로드 실패: {completion_logs_result.get('message')}")
+                except Exception as e:
+                    st.error(f"❌ 로드 중 오류: {e}")
+        
         # ⭐️ 세션 상태만 사용 (main()에서 이미 로드됨)
         completion_logs = st.session_state.get('completion_logs', [])
         
@@ -3492,6 +3559,16 @@ def display_completed_items_tab():
         if not completion_logs: # 여기서 파일이 없거나, 있어도 내용이 비었거나, 로드 실패 후 빈리스트가 된 모든 경우 처리
             st.info("완료 처리된 항목이 없습니다.")
             return
+
+        # 로드된 데이터 정보 표시
+        if completion_logs:
+            dates_in_logs = [log.get('날짜', '') for log in completion_logs if log.get('날짜')]
+            if dates_in_logs:
+                min_date = min(dates_in_logs)
+                max_date = max(dates_in_logs)
+                st.info(f"📊 로드된 완료 로그: {len(completion_logs)}개 항목 (날짜 범위: {min_date} ~ {max_date})")
+            else:
+                st.info(f"📊 로드된 완료 로그: {len(completion_logs)}개 항목 (날짜 정보 없음)")
 
         # DataFrame 생성
         completed_df = pd.DataFrame(completion_logs)
@@ -3667,82 +3744,67 @@ def force_reload_excel_data(s3_handler):
         return False
 
 def recalculate_mismatches(s3_handler):
-    """불일치 데이터를 재계산하고 S3에 저장"""
+    """불일치 데이터를 재계산하고 날짜별로 S3에 저장 (통합 파일 업데이트 포함)"""
     try:
-        if 'excel_data' in st.session_state and not st.session_state.excel_data.empty:
-            # 데이터프레임 복사본 생성
-            excel_df = st.session_state.excel_data.copy()
-            logger.info(f"불일치 데이터 재계산 시작: 엑셀 데이터 {len(excel_df)}개 행")
-            
-            # 불일치 데이터 계산
-            mismatch_result = data_analyzer.find_mismatches(excel_df)
-            
-            if mismatch_result["status"] == "success":
-                mismatch_data = mismatch_result["data"]
-                logger.info(f"초기 불일치 데이터 계산 완료: {len(mismatch_data)}개 항목")
-                
-                # 제외할 물품코드 리스트 (하드코딩)
-                excluded_item_codes = [
-                    'L505001', 'L505002', 'L505003', 'L505004', 'L505005', 'L505006', 'L505007', 
-                    'L505008', 'L505009', 'L505010', 'L505011', 'L505012', 'L505013', 'L505014',
-                    'L605001', 'L605002', 'L605003', 'L605004', 'L605005', 'L605006'
-                ]
-                
-                # 물품코드 필터링
-                if not mismatch_data.empty and '물품코드' in mismatch_data.columns:
-                    before_exclude = len(mismatch_data)
-                    mismatch_data = mismatch_data[
-                        ~mismatch_data['물품코드'].astype(str).isin(excluded_item_codes)
-                    ]
-                    after_exclude = len(mismatch_data)
-                    logger.info(f"물품코드 제외 필터링: {before_exclude}개 → {after_exclude}개 (제외된 항목: {before_exclude - after_exclude}개)")
-                
-                # 완료 처리 로그 필터링 (세션 상태 사용)
-                try:
-                    # 세션 상태에서 완료 로그 가져오기 (S3 로딩 없음)
-                    completion_logs = st.session_state.get('completion_logs', [])
-                    logger.info(f"완료 처리 로그 (세션): {len(completion_logs)}개 항목")
-                    
-                    if not mismatch_data.empty and completion_logs:
-                        # 완료 처리된 항목 필터링
-                        before_completion_filter = len(mismatch_data)
-                        filtered_data = filter_completed_items(mismatch_data, completion_logs)
-                        after_completion_filter = len(filtered_data)
-                        st.session_state.mismatch_data = filtered_data.reset_index(drop=True)
-                        logger.info(f"완료 처리 필터링: {before_completion_filter}개 → {after_completion_filter}개 (제외된 항목: {before_completion_filter - after_completion_filter}개)")
-                    else:
-                        # 완료 처리된 항목이 없거나 불일치 데이터가 비어있음
-                        st.session_state.mismatch_data = mismatch_data.reset_index(drop=True)
-                        logger.info(f"완료 처리 필터링 건너뜀: 최종 {len(st.session_state.mismatch_data)}개 항목")
-                except Exception as filter_err:
-                    logger.error(f"완료 항목 필터링 중 오류 발생: {str(filter_err)}", exc_info=True)
-                    # 필터링 오류시 원본 데이터 사용
-                    st.session_state.mismatch_data = mismatch_data.reset_index(drop=True)
-                    logger.info(f"필터링 오류로 원본 데이터 사용: {len(st.session_state.mismatch_data)}개 항목")
-                
-                # 날짜별로 S3에 저장 (중요: 기본 불일치 데이터를 날짜별로 저장)
-                try:
-                    logger.info(f"세션에 저장된 최종 불일치 데이터: {len(st.session_state.mismatch_data)}개 항목")
-                    save_all_date_mismatches(s3_handler, st.session_state.mismatch_data)
-                    
-                    # 전체 통합 파일도 업데이트
-                    update_result = s3_handler.update_full_mismatches_json()
-                    if update_result["status"] == "success":
-                        logger.info(f"전체 통합 파일 업데이트 완료: {update_result.get('count', 0)}개 항목")
-                        logger.info(f"기본 불일치 데이터 재계산 및 저장 성공: 세션 {len(st.session_state.mismatch_data)}개 항목")
-                        return True
-                    else:
-                        logger.error(f"전체 통합 파일 업데이트 실패: {update_result['message']}")
-                        return False
-                except Exception as save_err:
-                    logger.error(f"S3 저장 중 오류 발생: {str(save_err)}", exc_info=True)
-                    return False
-            else:
-                logger.error(f"불일치 데이터 계산 실패: {mismatch_result['message']}")
-                return False
-        else:
+        if 'excel_data' not in st.session_state or st.session_state.excel_data.empty:
             logger.warning("엑셀 데이터가 없어 불일치 데이터를 계산하지 않습니다.")
             return False
+            
+        # 데이터프레임 복사본 생성
+        excel_df = st.session_state.excel_data.copy()
+        logger.info(f"불일치 데이터 재계산 시작: 엑셀 데이터 {len(excel_df)}개 행")
+        
+        # 불일치 데이터 계산
+        mismatch_result = data_analyzer.find_mismatches(excel_df)
+        
+        if mismatch_result["status"] != "success":
+            logger.error(f"불일치 데이터 계산 실패: {mismatch_result['message']}")
+            return False
+            
+        mismatch_data = mismatch_result["data"]
+        logger.info(f"초기 불일치 데이터 계산 완료: {len(mismatch_data)}개 항목")
+        
+        # 물품코드 필터링 제거 (process_files에서 이미 제외됨)
+        # 완료 처리 로그 필터링만 수행
+        completion_logs = st.session_state.get('completion_logs', [])
+        if not mismatch_data.empty and completion_logs:
+            before_filter = len(mismatch_data)
+            mismatch_data = filter_completed_items(mismatch_data, completion_logs)
+            after_filter = len(mismatch_data)
+            logger.info(f"완료 처리 필터링: {before_filter}개 → {after_filter}개")
+        
+        st.session_state.mismatch_data = mismatch_data.reset_index(drop=True)
+        
+        # 날짜별로 S3에 저장
+        if not mismatch_data.empty:
+            if pd.api.types.is_datetime64_any_dtype(mismatch_data['날짜']):
+                unique_dates = mismatch_data['날짜'].dt.strftime('%Y-%m-%d').unique()
+            else:
+                unique_dates = pd.to_datetime(mismatch_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d').unique()
+            
+            for date_str in unique_dates:
+                if pd.isna(date_str) or date_str == 'NaT':
+                    continue
+                    
+                if pd.api.types.is_datetime64_any_dtype(mismatch_data['날짜']):
+                    date_data = mismatch_data[
+                        mismatch_data['날짜'].dt.strftime('%Y-%m-%d') == date_str
+                    ].copy()
+                else:
+                    date_data = mismatch_data[mismatch_data['날짜'] == date_str].copy()
+                
+                s3_handler.save_mismatch_data(date_str, date_data)
+                logger.info(f"날짜 {date_str} 데이터 저장: {len(date_data)}개 항목")
+        
+        # 전체 통합 파일 업데이트
+        update_result = s3_handler.update_full_mismatches_json()
+        if update_result["status"] == "success":
+            logger.info(f"전체 통합 파일 업데이트 완료: {update_result.get('count', 0)}개 항목")
+            return True
+        else:
+            logger.error(f"전체 통합 파일 업데이트 실패: {update_result['message']}")
+            return False
+            
     except Exception as e:
         logger.error(f"불일치 데이터 재계산 중 오류 발생: {str(e)}", exc_info=True)
         return False
@@ -3840,4 +3902,5 @@ if __name__ == "__main__":
         st.error("S3 스토리지 연결에 실패했습니다. 관리자에게 문의하세요.")
         exit()
     
+  
     main() 

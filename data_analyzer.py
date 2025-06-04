@@ -106,7 +106,11 @@ def load_excel_data(file_path, is_cumulative_flag: bool = False):
         combined_df = combined_df.loc[:, ~combined_df.columns.duplicated(keep='first')]
         final_columns_after_dedup = combined_df.columns.tolist()
         if len(original_columns_before_dedup) != len(final_columns_after_dedup):
-            logger.warning(f"데이터 병합 후 중복 컬럼 제거됨. 이전: {original_columns_before_dedup}, 이후: {final_columns_after_dedup}")
+            removed_columns = [col for col in original_columns_before_dedup if col not in final_columns_after_dedup]
+            logger.warning(f"[컬럼 중복 제거] 중복된 컬럼명 제거됨. 제거된 컬럼: {removed_columns}")
+            logger.warning(f"[컬럼 중복 제거] 이전 컬럼 수: {len(original_columns_before_dedup)}, 이후 컬럼 수: {len(final_columns_after_dedup)}")
+        else:
+            logger.info(f"[컬럼 중복 제거] 중복된 컬럼명 없음. 총 {len(final_columns_after_dedup)}개 컬럼")
         # --------------------------------
 
         logger.info(f"로드된 데이터 컬럼 (중복 제거 후, 변경 전): {combined_df.columns.tolist()}")
@@ -165,7 +169,11 @@ def load_excel_data(file_path, is_cumulative_flag: bool = False):
         combined_df = combined_df.loc[:, ~combined_df.columns.duplicated(keep='first')]
         final_columns_after_std_dedup = combined_df.columns.tolist()
         if len(original_columns_before_std_dedup) != len(final_columns_after_std_dedup):
-             logger.warning(f"컬럼 표준화 후 중복 컬럼 제거됨. 이전: {original_columns_before_std_dedup}, 이후: {final_columns_after_std_dedup}")
+             removed_std_columns = [col for col in original_columns_before_std_dedup if col not in final_columns_after_std_dedup]
+             logger.warning(f"[표준화 후 컬럼 중복 제거] 중복된 컬럼명 제거됨. 제거된 컬럼: {removed_std_columns}")
+             logger.warning(f"[표준화 후 컬럼 중복 제거] 이전 컬럼 수: {len(original_columns_before_std_dedup)}, 이후 컬럼 수: {len(final_columns_after_std_dedup)}")
+        else:
+             logger.info(f"[표준화 후 컬럼 중복 제거] 중복된 컬럼명 없음. 총 {len(final_columns_after_std_dedup)}개 컬럼")
         # ----------------------------------------------------
 
         required_std_cols = ['부서명', '물품코드', '물품명', '청구량', '수령량']
@@ -195,6 +203,51 @@ def load_excel_data(file_path, is_cumulative_flag: bool = False):
                 logger.info(f"부서 '{dept}'의 고유 물품코드 수: {count}")
 
         logger.info(f"최종 데이터프레임 크기: {combined_df.shape}")
+        
+        # --- 데이터 행 중복 검사 및 상세 로그 ---
+        logger.info(f"[데이터 행 중복 검사] 시작 - 총 {len(combined_df)}개 행")
+        
+        # 1. 전체 행 중복 검사 (모든 컬럼 기준)
+        before_full_dedup = len(combined_df)
+        full_duplicates = combined_df.duplicated(keep=False)
+        full_duplicate_count = full_duplicates.sum()
+        
+        if full_duplicate_count > 0:
+            logger.warning(f"[전체 행 중복] {full_duplicate_count}개 완전 중복 행 발견")
+            # 중복 행 샘플 표시 (최대 5개)
+            duplicate_samples = combined_df[full_duplicates].head(5)
+            for idx, row in duplicate_samples.iterrows():
+                logger.warning(f"[전체 행 중복 샘플] 날짜:{row.get('날짜', 'N/A')}, 부서:{row.get('부서명', 'N/A')}, 물품코드:{row.get('물품코드', 'N/A')}, 물품명:{row.get('물품명', 'N/A')}")
+        else:
+            logger.info(f"[전체 행 중복] 완전 중복 행 없음")
+        
+        # 2. 핵심 컬럼 기준 중복 검사 (날짜, 부서명, 물품코드)
+        key_columns = ['날짜', '부서명', '물품코드']
+        available_key_columns = [col for col in key_columns if col in combined_df.columns]
+        
+        if len(available_key_columns) >= 3:
+            key_duplicates = combined_df.duplicated(subset=available_key_columns, keep=False)
+            key_duplicate_count = key_duplicates.sum()
+            
+            if key_duplicate_count > 0:
+                logger.warning(f"[핵심 컬럼 중복] {key_duplicate_count}개 행이 {available_key_columns} 기준으로 중복됨")
+                # 중복 그룹별 분석
+                duplicate_groups = combined_df[key_duplicates].groupby(available_key_columns)
+                for group_key, group_df in duplicate_groups:
+                    if len(group_df) > 1:
+                        logger.warning(f"[핵심 컬럼 중복 그룹] {dict(zip(available_key_columns, group_key))}: {len(group_df)}개 행")
+                        # 그룹 내 차이점 분석
+                        for idx, row in group_df.iterrows():
+                            청구량 = row.get('청구량', 'N/A')
+                            수령량 = row.get('수령량', 'N/A')
+                            logger.warning(f"  - 행{idx}: 청구량={청구량}, 수령량={수령량}")
+            else:
+                logger.info(f"[핵심 컬럼 중복] {available_key_columns} 기준 중복 행 없음")
+        else:
+            logger.warning(f"[핵심 컬럼 중복] 검사 불가 - 필요 컬럼 부족: {available_key_columns}")
+        
+        logger.info(f"[데이터 행 중복 검사] 완료")
+        
         return {"status": "success", "data": combined_df}
 
     except Exception as e:
@@ -249,6 +302,30 @@ def find_mismatches(df):
         
         # 불일치 항목 찾기
         df_mismatch = df_compare[df_compare['청구량'] != df_compare['수령량']].copy()
+        
+        # 불일치 데이터에서 중복 검사
+        logger.debug(f"[불일치 데이터 중복 검사] 시작 - 총 {len(df_mismatch)}개 불일치 행")
+        
+        if not df_mismatch.empty:
+            # 핵심 컬럼 기준 중복 검사
+            key_columns = ['날짜', '부서명', '물품코드']
+            mismatch_duplicates = df_mismatch.duplicated(subset=key_columns, keep=False)
+            mismatch_duplicate_count = mismatch_duplicates.sum()
+            
+            if mismatch_duplicate_count > 0:
+                logger.warning(f"[불일치 데이터 중복] {mismatch_duplicate_count}개 행이 {key_columns} 기준으로 중복됨")
+                # 중복 그룹별 분석
+                duplicate_groups = df_mismatch[mismatch_duplicates].groupby(key_columns)
+                for group_key, group_df in duplicate_groups:
+                    if len(group_df) > 1:
+                        logger.warning(f"[불일치 중복 그룹] {dict(zip(key_columns, group_key))}: {len(group_df)}개 행")
+                        for idx, row in group_df.iterrows():
+                            청구량 = row.get('청구량', 'N/A')
+                            수령량 = row.get('수령량', 'N/A')
+                            차이 = row.get('차이', 'N/A')
+                            logger.warning(f"  - 행{idx}: 청구량={청구량}, 수령량={수령량}, 차이={차이}")
+            else:
+                logger.debug(f"[불일치 데이터 중복] {key_columns} 기준 중복 행 없음")
         
         # 결과가 비어있지 않은지 확인
         if df_mismatch.empty:

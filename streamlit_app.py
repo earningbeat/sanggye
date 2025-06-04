@@ -81,9 +81,7 @@ S3_DIRS = {
     "RESULTS": "results/",  # 분석 결과 저장 디렉토리 추가
     "PREVIEW_IMAGES": "preview_images/"  # 미리보기 이미지 디렉토리 추가
 }
-
-
-    
+  
 
 
 class S3Handler:
@@ -122,9 +120,7 @@ class S3Handler:
         """S3 파일의 마지막 수정 시각을 반환 (datetime)"""
         try:
             response = self.s3_client.head_object(Bucket=self.bucket, Key=key)
-            return response['LastModified']
-        except Exception:
-            return None
+
 
     def save_metadata(self, date_str, metadata):
         """메타데이터 저장"""
